@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -45,6 +47,13 @@ type Config struct {
 
 	// Args are the positional (non-flag) command line arguments
 	Args []string
+}
+
+type application struct {
+	auth struct {
+		username string
+		password string
+	}
 }
 
 // parseFlags parses the command-line arguments provided to the program.
@@ -131,6 +140,14 @@ func makeRedisConnOpt(cfg *Config) (asynq.RedisConnOpt, error) {
 	return connOpt, nil
 }
 
+func getenv(key, fallback string) string {
+	value := os.Getenv(key)
+	if len(value) == 0 {
+		return fallback
+	}
+	return value
+}
+
 func main() {
 	cfg, output, err := parseFlags(os.Args[0], os.Args[1:])
 	if err == flag.ErrHelp {
@@ -146,6 +163,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	asynqmonUser := getenv("ASYNQMON_USER", "admin")
+	asynqmonPassword := getenv("ASYNQMON_PASSWORD", "admin")
+	app := new(application)
+	app.auth.username = asynqmonUser
+	app.auth.password = asynqmonPassword
 
 	h := asynqmon.New(asynqmon.Options{
 		RedisConnOpt:      redisConnOpt,
@@ -160,7 +182,8 @@ func main() {
 		AllowedMethods: []string{"GET", "POST", "DELETE"},
 	})
 	mux := http.NewServeMux()
-	mux.Handle("/", c.Handler(h))
+	//mux.Handle("/", c.Handler(h))
+	mux.Handle("/", app.basicAuth(h, c))
 	if cfg.EnableMetricsExporter {
 		// Using NewPedanticRegistry here to test the implementation of Collectors and Metrics.
 		reg := prometheus.NewPedanticRegistry()
@@ -185,6 +208,32 @@ func main() {
 
 	fmt.Printf("Asynq Monitoring WebUI server is listening on port %d\n", cfg.Port)
 	log.Fatal(srv.ListenAndServe())
+}
+
+//https://github.com/syahidfrd/asynqmon-handler.git
+func (app *application) basicAuth(next *asynqmon.HTTPHandler, c *cors.Cors) http.Handler {
+	corsHandlerFun := c.Handler(next).(http.HandlerFunc)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		log.Printf("uer/pass:%s,%s\n", username, password)
+		if ok {
+			usernameHash := sha256.Sum256([]byte(username))
+			passwordHash := sha256.Sum256([]byte(password))
+			expectedUsernameHash := sha256.Sum256([]byte(app.auth.username))
+			expectedPasswordHash := sha256.Sum256([]byte(app.auth.password))
+
+			usernameMatch := (subtle.ConstantTimeCompare(usernameHash[:], expectedUsernameHash[:]) == 1)
+			passwordMatch := (subtle.ConstantTimeCompare(passwordHash[:], expectedPasswordHash[:]) == 1)
+
+			if usernameMatch && passwordMatch {
+				log.Printf("uer/pass:%s,%s match\n", username, password)
+				corsHandlerFun(w, r)
+			}
+		}
+
+		w.Header().Set("WWW-Authenticate", `Basic realm="restricted", charset="UTF-8"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	})
 }
 
 func payloadFormatterFunc(cfg *Config) func(string, []byte) string {
